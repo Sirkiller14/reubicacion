@@ -1,0 +1,26 @@
+# Dependencias del Sistema de Planificación Urbana con Reordenamiento
+
+# Análisis de redes y datos geoespaciales
+osmnx==1.9.3
+networkx==3.3
+geopandas==0.14.3
+shapely==2.0.3
+rtree==1.2.0
+
+# Procesamiento de datos
+numpy==1.26.4
+pandas==2.2.1
+
+# Optimización multi-objetivo
+pymoo==0.6.1.1
+
+# Visualización
+folium==0.16.0
+matplotlib==3.8.3
+
+# Utilidades
+tqdm==4.66.2
+
+# Dependencias adicionales de GeoPandas
+fiona==1.9.6
+pyproj==3.6.1
