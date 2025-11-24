@@ -1,5 +1,5 @@
 """
-Sistema de Planificación Urbana con Reordenamiento 
+Sistema de Planificación Urbana con Reordenamiento  
 """
 import argparse
 import warnings
