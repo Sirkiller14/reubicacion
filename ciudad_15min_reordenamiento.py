@@ -1,23 +1,6 @@
 """
-Sistema de Planificación Urbana con Reordenamiento Dinámico
-Autor: Mejorado por Claude
-Descripción:
- Este sistema permite el INTERCAMBIO DINÁMICO entre hogares y servicios para optimizar
- la accesibilidad urbana bajo el concepto de Ciudad de 15 Minutos.
- 
- CARACTERÍSTICAS PRINCIPALES:
- 1. Mantiene constante el número de hogares
- 2. Permite que hogares y servicios intercambien posiciones
- 3. Optimización iterativa con NSGA-II
- 4. Preserva la morfología urbana mientras mejora la distribución
- 
-Requisitos:
-    pip install osmnx==1.9.3 networkx==3.3 geopandas shapely rtree numpy pandas tqdm folium pymoo==0.6.1.1
-
-Uso:
-    python ciudad_15min_reordenamiento.py --place "San Juan de Miraflores, Lima, Peru" --minutes 15 --iterations 5 --plot
+Sistema de Planificación Urbana con Reordenamiento 
 """
-
 import argparse
 import warnings
 warnings.filterwarnings("ignore")
@@ -25,8 +8,8 @@ warnings.filterwarnings("ignore")
 import os
 import math
 import json
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Set, Optional
 from collections import Counter
 
 import osmnx as ox
@@ -47,6 +30,7 @@ try:
     from pymoo.core.repair import Repair
     from pymoo.core.crossover import Crossover
     from pymoo.core.mutation import Mutation
+    from pymoo.core.callback import Callback
     # Suprimir advertencia sobre módulos compilados
     try:
         from pymoo.config import Config
@@ -56,6 +40,14 @@ try:
     PYMOO_OK = True
 except Exception:
     PYMOO_OK = False
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')  # Backend sin GUI para servidores
+    MATPLOTLIB_OK = True
+except Exception:
+    MATPLOTLIB_OK = False
 
 # -----------------------------
 # CONFIGURACIÓN DE SERVICIOS
@@ -188,28 +180,88 @@ def calculate_coverage(
     homes: gpd.GeoDataFrame,
     services: gpd.GeoDataFrame,
     threshold_min: float = 15.0,
+    home_nodes_precomputed: pd.Series = None,
+    serv_nodes_precomputed: pd.Series = None,
 ) -> Tuple[float, np.ndarray]:
     """
     Calcula la cobertura de accesibilidad
     Retorna: (cobertura_porcentaje, array_booleano_de_alcanzabilidad)
+    
+    CORRECCIÓN: Calcula la distancia desde cada hogar hacia el servicio más cercano
+    para evitar inconsistencias donde casas cercanas tienen tiempos muy diferentes.
     """
     if services.empty or homes.empty:
         return 0.0, np.zeros(len(homes), dtype=bool)
     
-    home_nodes = nearest_node_series(G, homes)
-    serv_nodes = nearest_node_series(G, services)
+    # Usar nodos precalculados si están disponibles (más eficiente y consistente)
+    if home_nodes_precomputed is not None and len(home_nodes_precomputed) == len(homes):
+        home_nodes = home_nodes_precomputed
+    else:
+        home_nodes = nearest_node_series(G, homes)
+    
+    if serv_nodes_precomputed is not None and len(serv_nodes_precomputed) == len(services):
+        serv_nodes = serv_nodes_precomputed
+    else:
+        serv_nodes = nearest_node_series(G, services)
+    
     uniq_serv_nodes = list(set(serv_nodes.dropna().tolist()))
     
     if not uniq_serv_nodes:
         return 0.0, np.zeros(len(homes), dtype=bool)
     
-    # Dijkstra multi-source para eficiencia
-    lengths = nx.multi_source_dijkstra_path_length(G, uniq_serv_nodes, weight="travel_time")
-    
+    # CORRECCIÓN: Calcular distancia desde cada nodo de hogar hacia el servicio más cercano
+    # Para evitar inconsistencias donde casas cercanas tienen tiempos muy diferentes,
+    # calculamos desde cada hogar hacia TODOS los servicios y tomamos el mínimo
     reachable = np.zeros(len(homes), dtype=bool)
+    
+    # Calcular distancias desde todos los servicios hacia todos los nodos alcanzables
+    # Esto nos da: para cada nodo alcanzable, la distancia mínima a cualquier servicio
+    try:
+        lengths_from_services = nx.multi_source_dijkstra_path_length(G, uniq_serv_nodes, weight="travel_time")
+    except Exception as e:
+        # Si falla multi_source, usar enfoque alternativo
+        print(f"[ADVERTENCIA] Error en multi_source_dijkstra: {e}")
+        lengths_from_services = {}
+        for serv_node in uniq_serv_nodes:
+            try:
+                lengths = nx.single_source_dijkstra_path_length(G, serv_node, weight="travel_time")
+                # Actualizar con mínimos
+                for node, dist in lengths.items():
+                    if node not in lengths_from_services or dist < lengths_from_services[node]:
+                        lengths_from_services[node] = dist
+            except Exception:
+                continue
+    
+    # Para cada hogar, buscar la distancia mínima al servicio más cercano
+    unique_home_nodes = {}
     for i, (idx, hn) in enumerate(home_nodes.items()):
-        t = lengths.get(hn, np.inf)
-        reachable[i] = (t / 60.0) <= threshold_min
+        # Agrupar hogares por nodo para evitar cálculos duplicados
+        if hn not in unique_home_nodes:
+            unique_home_nodes[hn] = []
+        unique_home_nodes[hn].append(i)
+    
+    # Calcular tiempo para cada nodo único de hogar
+    for hn, indices in unique_home_nodes.items():
+        if hn in lengths_from_services:
+            # Tiempo en segundos desde este nodo al servicio más cercano
+            t_seconds = lengths_from_services[hn]
+            t_minutes = t_seconds / 60.0
+        else:
+            # Nodo no alcanzable: intentar calcular desde este nodo hacia los servicios
+            t_minutes = np.inf
+            for serv_node in uniq_serv_nodes:
+                try:
+                    if nx.has_path(G, hn, serv_node):
+                        path_length = nx.shortest_path_length(G, hn, serv_node, weight="travel_time")
+                        t_minutes_candidate = path_length / 60.0
+                        if t_minutes_candidate < t_minutes:
+                            t_minutes = t_minutes_candidate
+                except Exception:
+                    continue
+        
+        # Asignar el mismo tiempo a todos los hogares en este nodo
+        for idx in indices:
+            reachable[idx] = t_minutes <= threshold_min
     
     coverage = float(np.mean(reachable))
     return coverage, reachable
@@ -268,19 +320,35 @@ class FeasibleSampling(Sampling):
 
 
 class FeasibleSamplingAllCategories(Sampling):
-    """Inicialización para todas las categorías: 0=hogar, 1=health, 2=education, 3=greens, 4=work"""
+    """Inicialización para todas las categorías: 0=hogar, 1=health, 2=education, 3=greens, 4=work
     
-    def __init__(self, n_homes: int, n_health: int, n_education: int, n_greens: int, n_work: int):
+    Genera soluciones cercanas a la configuración inicial con un porcentaje controlado de cambios.
+    """
+    
+    def __init__(self, n_homes: int, n_health: int, n_education: int, n_greens: int, n_work: int,
+                 initial_change_percentage: float = 0.02):
+        """
+        Args:
+            initial_change_percentage: Porcentaje de cambios iniciales (0.05 = 5% por defecto)
+        """
         super().__init__()
         self.n_homes = n_homes
         self.n_health = n_health
         self.n_education = n_education
         self.n_greens = n_greens
         self.n_work = n_work
+        self.initial_change_percentage = initial_change_percentage
     
     def _do(self, problem, n_samples, **kwargs):
         n_var = problem.n_var
         X = np.zeros((n_samples, n_var), dtype=int)
+        
+        # Obtener configuración inicial del problema
+        if hasattr(problem, 'initial_config'):
+            initial_config = problem.initial_config.copy()
+        else:
+            # Fallback: no hay configuración inicial, usar comportamiento aleatorio
+            initial_config = None
         
         rng = np.random.default_rng()
         total_assigned = self.n_homes + self.n_health + self.n_education + self.n_greens + self.n_work
@@ -290,36 +358,63 @@ class FeasibleSamplingAllCategories(Sampling):
             raise ValueError(f"Total asignado ({total_assigned}) excede número de variables ({n_var})")
         
         for i in range(n_samples):
-            x = np.zeros(n_var, dtype=int)
-            # Asignar tipos de forma aleatoria pero respetando las cantidades
-            indices = np.arange(n_var)
-            rng.shuffle(indices)
-            
-            # Asignar hogares (0)
-            if self.n_homes > 0:
-                x[indices[:self.n_homes]] = 0
-                start = self.n_homes
+            if initial_config is not None:
+                # ESTRATEGIA: Empezar con configuración inicial y hacer solo un porcentaje de cambios
+                x = initial_config.copy()
+                
+                # Calcular número de cambios basado en porcentaje
+                n_changes = int(n_var * self.initial_change_percentage)
+                # Asegurar límites razonables: mínimo 1, máximo 50% del total
+                n_changes = max(1, min(n_changes, n_var // 2))
+                
+                # Hacer n_changes intercambios aleatorios manteniendo las cantidades correctas
+                for _ in range(n_changes):
+                    # Seleccionar dos tipos diferentes al azar
+                    types = [0, 1, 2, 3, 4]
+                    type1, type2 = rng.choice(types, size=2, replace=False)
+                    
+                    # Encontrar ubicaciones de cada tipo
+                    type1_indices = np.where(x == type1)[0]
+                    type2_indices = np.where(x == type2)[0]
+                    
+                    if len(type1_indices) > 0 and len(type2_indices) > 0:
+                        # Seleccionar un índice aleatorio de cada tipo
+                        idx1 = rng.choice(type1_indices)
+                        idx2 = rng.choice(type2_indices)
+                        
+                        # Intercambiar (esto mantiene las cantidades correctas)
+                        x[idx1], x[idx2] = x[idx2], x[idx1]
             else:
-                start = 0
-            
-            # Asignar health (1)
-            if self.n_health > 0:
-                x[indices[start:start+self.n_health]] = 1
-                start += self.n_health
-            
-            # Asignar education (2)
-            if self.n_education > 0:
-                x[indices[start:start+self.n_education]] = 2
-                start += self.n_education
-            
-            # Asignar greens (3)
-            if self.n_greens > 0:
-                x[indices[start:start+self.n_greens]] = 3
-                start += self.n_greens
-            
-            # Asignar work (4)
-            if self.n_work > 0:
-                x[indices[start:start+self.n_work]] = 4
+                # Fallback: comportamiento original (aleatorio completo) si no hay initial_config
+                x = np.zeros(n_var, dtype=int)
+                indices = np.arange(n_var)
+                rng.shuffle(indices)
+                
+                # Asignar hogares (0)
+                if self.n_homes > 0:
+                    x[indices[:self.n_homes]] = 0
+                    start = self.n_homes
+                else:
+                    start = 0
+                
+                # Asignar health (1)
+                if self.n_health > 0:
+                    x[indices[start:start+self.n_health]] = 1
+                    start += self.n_health
+                
+                # Asignar education (2)
+                if self.n_education > 0:
+                    x[indices[start:start+self.n_education]] = 2
+                    start += self.n_education
+                
+                # Asignar greens (3)
+                if self.n_greens > 0:
+                    x[indices[start:start+self.n_greens]] = 3
+                    start += self.n_greens
+                
+                # Asignar work (4)
+                if self.n_work > 0:
+                    x[indices[start:start+self.n_work]] = 4
             
             X[i] = x
         
@@ -538,7 +633,7 @@ class FeasibleCrossoverAllCategories(Crossover):
 class FeasibleMutationAllCategories(Mutation):
     """Mutación para variables categóricas que intercambia tipos manteniendo números correctos"""
     
-    def __init__(self, n_homes: int, n_health: int, n_education: int, n_greens: int, n_work: int, prob=0.2):
+    def __init__(self, n_homes: int, n_health: int, n_education: int, n_greens: int, n_work: int, prob=0.7):
         super().__init__()
         self.targets = {
             0: n_homes,
@@ -842,30 +937,61 @@ class ReorderingProblemAllCategories(ElementwiseProblem):
         # Calcular cobertura para cada categoría
         objectives = []
         
+        # Usar nodos precalculados para consistencia
+        home_mask_indices = np.where(x == 0)[0]
+        health_mask_indices = np.where(x == 1)[0]
+        education_mask_indices = np.where(x == 2)[0]
+        greens_mask_indices = np.where(x == 3)[0]
+        work_mask_indices = np.where(x == 4)[0]
+        
         # f1: Minimizar (1 - cobertura_health)
         if not health_locs.empty and not homes_locs.empty:
-            cov_health, _ = calculate_coverage(self.G, homes_locs, health_locs, self.minutes)
+            home_nodes_subset = self.location_nodes.iloc[home_mask_indices] if len(home_mask_indices) > 0 else None
+            serv_nodes_subset = self.location_nodes.iloc[health_mask_indices] if len(health_mask_indices) > 0 else None
+            cov_health, _ = calculate_coverage(
+                self.G, homes_locs, health_locs, self.minutes,
+                home_nodes_precomputed=home_nodes_subset,
+                serv_nodes_precomputed=serv_nodes_subset
+            )
             objectives.append(1.0 - cov_health)
         else:
             objectives.append(1.0)
         
         # f2: Minimizar (1 - cobertura_education)
         if not education_locs.empty and not homes_locs.empty:
-            cov_education, _ = calculate_coverage(self.G, homes_locs, education_locs, self.minutes)
+            home_nodes_subset = self.location_nodes.iloc[home_mask_indices] if len(home_mask_indices) > 0 else None
+            serv_nodes_subset = self.location_nodes.iloc[education_mask_indices] if len(education_mask_indices) > 0 else None
+            cov_education, _ = calculate_coverage(
+                self.G, homes_locs, education_locs, self.minutes,
+                home_nodes_precomputed=home_nodes_subset,
+                serv_nodes_precomputed=serv_nodes_subset
+            )
             objectives.append(1.0 - cov_education)
         else:
             objectives.append(1.0)
         
         # f3: Minimizar (1 - cobertura_greens)
         if not greens_locs.empty and not homes_locs.empty:
-            cov_greens, _ = calculate_coverage(self.G, homes_locs, greens_locs, self.minutes)
+            home_nodes_subset = self.location_nodes.iloc[home_mask_indices] if len(home_mask_indices) > 0 else None
+            serv_nodes_subset = self.location_nodes.iloc[greens_mask_indices] if len(greens_mask_indices) > 0 else None
+            cov_greens, _ = calculate_coverage(
+                self.G, homes_locs, greens_locs, self.minutes,
+                home_nodes_precomputed=home_nodes_subset,
+                serv_nodes_precomputed=serv_nodes_subset
+            )
             objectives.append(1.0 - cov_greens)
         else:
             objectives.append(1.0)
         
         # f4: Minimizar (1 - cobertura_work)
         if not work_locs.empty and not homes_locs.empty:
-            cov_work, _ = calculate_coverage(self.G, homes_locs, work_locs, self.minutes)
+            home_nodes_subset = self.location_nodes.iloc[home_mask_indices] if len(home_mask_indices) > 0 else None
+            serv_nodes_subset = self.location_nodes.iloc[work_mask_indices] if len(work_mask_indices) > 0 else None
+            cov_work, _ = calculate_coverage(
+                self.G, homes_locs, work_locs, self.minutes,
+                home_nodes_precomputed=home_nodes_subset,
+                serv_nodes_precomputed=serv_nodes_subset
+            )
             objectives.append(1.0 - cov_work)
         else:
             objectives.append(1.0)
@@ -875,7 +1001,11 @@ class ReorderingProblemAllCategories(ElementwiseProblem):
         n_changes = int((x != self.initial_config).sum())
         # Normalizar por número total de ubicaciones (para que esté entre 0 y 1)
         change_ratio = n_changes / len(x) if len(x) > 0 else 1.0
-        objectives.append(change_ratio)
+        # PESO MODERADO: Multiplicar por 5.0 para penalizar los cambios durante la evolución
+        # Esto hace que el algoritmo prefiera soluciones con menos cambios, pero permite
+        # más exploración que con pesos extremadamente altos. Con 5.0, los cambios tienen
+        # un costo moderado, balanceando entre mantener la configuración inicial y mejorar cobertura.
+        objectives.append(change_ratio * 5.0)
         
         # Restricciones: debe haber exactamente el número objetivo de cada tipo
         margin = max(1, int(min(self.n_homes, self.n_health, self.n_education, self.n_greens, self.n_work) * 0.01))
@@ -896,13 +1026,874 @@ class ReorderingProblemAllCategories(ElementwiseProblem):
         out["G"] = [g1, g2, g3, g4, g5]
 
 
+# -----------------------------
+# TRACKING DE INTERCAMBIOS Y CALLBACK PERSONALIZADO
+# -----------------------------
+
+@dataclass
+class ExchangeTracker:
+    """Clase para rastrear intercambios en individuos"""
+    generation: int
+    individual_index: int
+    n_exchanges: int  # Número de intercambios (cambios respecto a inicial)
+    objectives: List[float] = field(default_factory=list)
+    solution: Optional[np.ndarray] = None
+
+
+class EvolutionCallback(Callback):
+    """
+    Callback personalizado para NSGA-II que rastrea intercambios por generación.
+    Captura datos en tiempo real sin afectar el rendimiento.
+    """
+    
+    def __init__(self, initial_config: np.ndarray, track_generations: List[int] = None):
+        """
+        Args:
+            initial_config: Configuración inicial (referencia para calcular intercambios)
+            track_generations: Lista de generaciones específicas a capturar (ej: [1, 2, 3, 78, 79, 80])
+        """
+        super().__init__()
+        self.initial_config = initial_config.copy()
+        self.track_generations = track_generations if track_generations else list(range(1, 11)) + list(range(95, 105)) + list(range(191, 201))
+        
+        # Almacenamiento de datos
+        self.generation_data: Dict[int, Dict] = {}
+        self.exchange_tracking: List[ExchangeTracker] = []
+        self.evolution_history: List[Dict] = []
+    
+    def notify(self, algorithm):
+        """Se llama en cada generación"""
+        try:
+            generation = algorithm.n_gen
+            
+            # Calcular estadísticas de la población actual
+            # En pymoo 0.6.1.1, el algoritmo tiene una población con X y F
+            pop = algorithm.pop
+            if pop is None:
+                return
+            
+            # Intentar diferentes formas de acceder a los datos
+            X = None
+            F = None
+            
+            if hasattr(pop, 'get'):
+                X = pop.get("X")
+                F = pop.get("F")
+            elif hasattr(pop, 'X') and hasattr(pop, 'F'):
+                X = pop.X
+                F = pop.F
+            elif hasattr(pop, '__getitem__'):
+                try:
+                    X = pop["X"]
+                    F = pop["F"]
+                except:
+                    pass
+            
+            if X is None or F is None or len(X) == 0:
+                return
+        except Exception as e:
+            # Si hay error al acceder a los datos, ignorar esta generación
+            # (no afecta el rendimiento de la optimización)
+            return
+        
+        # Calcular intercambios para cada individuo
+        exchanges_per_individual = []
+        for i, x in enumerate(X):
+            # Número de intercambios = posiciones donde cambió respecto a inicial
+            n_exchanges = int((x != self.initial_config).sum())
+            exchanges_per_individual.append(n_exchanges)
+            
+            # Capturar individuos de generaciones específicas
+            if generation in self.track_generations:
+                tracker = ExchangeTracker(
+                    generation=generation,
+                    individual_index=i,
+                    n_exchanges=n_exchanges,
+                    objectives=F[i].tolist() if len(F) > i else [],
+                    solution=x.copy()
+                )
+                self.exchange_tracking.append(tracker)
+        
+        # Estadísticas por generación
+        stats = {
+            "generation": generation,
+            "mean_exchanges": float(np.mean(exchanges_per_individual)),
+            "std_exchanges": float(np.std(exchanges_per_individual)),
+            "min_exchanges": int(np.min(exchanges_per_individual)),
+            "max_exchanges": int(np.max(exchanges_per_individual)),
+            "median_exchanges": float(np.median(exchanges_per_individual)),
+            "n_individuals": len(X),
+            "best_objective": float(np.min(F[:, 0])) if len(F) > 0 and F.shape[1] > 0 else 0.0,
+            "mean_objective": float(np.mean(F[:, 0])) if len(F) > 0 and F.shape[1] > 0 else 0.0
+        }
+        
+        self.generation_data[generation] = stats
+        self.evolution_history.append(stats)
+    
+    def get_exchange_stats(self) -> pd.DataFrame:
+        """Obtiene estadísticas de intercambios como DataFrame"""
+        if not self.evolution_history:
+            return pd.DataFrame()
+        
+        return pd.DataFrame(self.evolution_history)
+    
+    def get_tracked_exchanges(self) -> pd.DataFrame:
+        """Obtiene intercambios capturados de generaciones específicas"""
+        if not self.exchange_tracking:
+            return pd.DataFrame()
+        
+        data = []
+        for tracker in self.exchange_tracking:
+            data.append({
+                "generation": tracker.generation,
+                "individual_index": tracker.individual_index,
+                "n_exchanges": tracker.n_exchanges,
+                "objectives": tracker.objectives,
+            })
+        
+        return pd.DataFrame(data)
+    
+    def export_detailed_stats(self, output_dir: str):
+        """Exporta estadísticas detalladas a CSV y JSON"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Estadísticas por generación
+        stats_df = self.get_exchange_stats()
+        if not stats_df.empty:
+            stats_df.to_csv(
+                os.path.join(output_dir, "exchange_stats_by_generation.csv"),
+                index=False
+            )
+        
+        # Intercambios capturados de generaciones específicas
+        tracked_df = self.get_tracked_exchanges()
+        if not tracked_df.empty:
+            tracked_df.to_csv(
+                os.path.join(output_dir, "tracked_exchanges_specific_generations.csv"),
+                index=False
+            )
+        
+        # Estadísticas agregadas en JSON
+        summary = {
+            "total_generations_tracked": len(self.generation_data),
+            "tracked_generations": sorted(self.track_generations),
+            "total_individuals_captured": len(self.exchange_tracking),
+            "statistics_by_generation": {
+                str(gen): stats for gen, stats in self.generation_data.items()
+            }
+        }
+        
+        with open(os.path.join(output_dir, "evolution_summary.json"), 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+
+
+def calculate_exchanges(initial_config: np.ndarray, solution: np.ndarray) -> int:
+    """
+    Calcula el número de intercambios (cambios) entre configuración inicial y solución
+    
+    Args:
+        initial_config: Configuración inicial
+        solution: Solución actual
+    
+    Returns:
+        Número de intercambios (posiciones que cambiaron)
+    """
+    return int((solution != initial_config).sum())
+
+
+# -----------------------------
+# ANÁLISIS EVOLUTIVO Y VISUALIZACIÓN
+# -----------------------------
+
+def plot_exchange_evolution(callback: EvolutionCallback, output_dir: str):
+    """
+    Genera gráficos de evolución de intercambios
+    
+    Args:
+        callback: Callback con datos de evolución
+        output_dir: Directorio donde guardar los gráficos
+    """
+    if not MATPLOTLIB_OK:
+        print("[ADVERTENCIA] matplotlib no instalado: omitiendo gráficos")
+        return
+    
+    if not callback.evolution_history:
+        print("[ADVERTENCIA] No hay datos de evolución para graficar")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    stats_df = callback.get_exchange_stats()
+    
+    if stats_df.empty:
+        return
+    
+    # 1. Evolución de intercambios promedio por generación
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Análisis Evolutivo de Intercambios', fontsize=16, fontweight='bold')
+    
+    # Gráfico 1: Evolución de intercambios promedio
+    ax1 = axes[0, 0]
+    ax1.plot(stats_df['generation'], stats_df['mean_exchanges'], 
+             label='Promedio', linewidth=2, color='blue')
+    ax1.fill_between(stats_df['generation'], 
+                     stats_df['mean_exchanges'] - stats_df['std_exchanges'],
+                     stats_df['mean_exchanges'] + stats_df['std_exchanges'],
+                     alpha=0.3, color='blue', label='±1 Desviación Estándar')
+    ax1.plot(stats_df['generation'], stats_df['min_exchanges'], 
+             '--', label='Mínimo', linewidth=1, color='green', alpha=0.7)
+    ax1.plot(stats_df['generation'], stats_df['max_exchanges'], 
+             '--', label='Máximo', linewidth=1, color='red', alpha=0.7)
+    ax1.set_xlabel('Generación', fontsize=11)
+    ax1.set_ylabel('Número de Intercambios', fontsize=11)
+    ax1.set_title('Evolución de Intercambios por Generación', fontsize=12, fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Gráfico 2: Distribución de intercambios (boxplot por generaciones seleccionadas)
+    ax2 = axes[0, 1]
+    tracked_df = callback.get_tracked_exchanges()
+    if not tracked_df.empty:
+        tracked_generations = sorted(tracked_df['generation'].unique())
+        box_data = [tracked_df[tracked_df['generation'] == gen]['n_exchanges'].values 
+                   for gen in tracked_generations]
+        bp = ax2.boxplot(box_data, labels=[f'Gen {g}' for g in tracked_generations], 
+                        patch_artist=True)
+        for patch in bp['boxes']:
+            patch.set_facecolor('lightblue')
+        ax2.set_xlabel('Generación', fontsize=11)
+        ax2.set_ylabel('Número de Intercambios', fontsize=11)
+        ax2.set_title('Distribución de Intercambios en Generaciones Específicas', 
+                     fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3, axis='y')
+    else:
+        ax2.text(0.5, 0.5, 'No hay datos para mostrar', 
+                ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('Distribución de Intercambios', fontsize=12)
+    
+    # Gráfico 3: Convergencia del algoritmo (objetivo)
+    ax3 = axes[1, 0]
+    if 'best_objective' in stats_df.columns and 'mean_objective' in stats_df.columns:
+        ax3.plot(stats_df['generation'], stats_df['best_objective'], 
+                label='Mejor Objetivo', linewidth=2, color='green')
+        ax3.plot(stats_df['generation'], stats_df['mean_objective'], 
+                label='Objetivo Promedio', linewidth=2, color='orange')
+        ax3.set_xlabel('Generación', fontsize=11)
+        ax3.set_ylabel('Valor del Objetivo', fontsize=11)
+        ax3.set_title('Convergencia del Algoritmo', fontsize=12, fontweight='bold')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, 'Datos de objetivos no disponibles', 
+                ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Convergencia del Algoritmo', fontsize=12)
+    
+    # Gráfico 4: Histograma de intercambios en generaciones específicas
+    ax4 = axes[1, 1]
+    if not tracked_df.empty:
+        all_exchanges = tracked_df['n_exchanges'].values
+        ax4.hist(all_exchanges, bins=20, edgecolor='black', alpha=0.7, color='steelblue')
+        ax4.axvline(np.mean(all_exchanges), color='red', linestyle='--', 
+                   linewidth=2, label=f'Promedio: {np.mean(all_exchanges):.1f}')
+        ax4.axvline(np.median(all_exchanges), color='green', linestyle='--', 
+                   linewidth=2, label=f'Mediana: {np.median(all_exchanges):.1f}')
+        ax4.set_xlabel('Número de Intercambios', fontsize=11)
+        ax4.set_ylabel('Frecuencia', fontsize=11)
+        ax4.set_title('Distribución de Intercambios (Todas las Generaciones Capturadas)', 
+                     fontsize=12, fontweight='bold')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3, axis='y')
+    else:
+        ax4.text(0.5, 0.5, 'No hay datos para mostrar', 
+                ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('Distribución de Intercambios', fontsize=12)
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "evolution_analysis.png")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Gráfico de evolución guardado en: {output_path}")
+    
+    # Gráfico adicional: Comparación entre generaciones específicas
+    if not tracked_df.empty:
+        fig2, ax = plt.subplots(figsize=(12, 6))
+        tracked_generations = sorted(tracked_df['generation'].unique())
+        
+        positions = np.arange(len(tracked_generations))
+        means = [tracked_df[tracked_df['generation'] == gen]['n_exchanges'].mean() 
+                for gen in tracked_generations]
+        stds = [tracked_df[tracked_df['generation'] == gen]['n_exchanges'].std() 
+               for gen in tracked_generations]
+        
+        bars = ax.bar(positions, means, yerr=stds, capsize=5, alpha=0.7, 
+                     color='steelblue', edgecolor='black', linewidth=1.5)
+        
+        ax.set_xlabel('Generación', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Intercambios Promedio', fontsize=12, fontweight='bold')
+        ax.set_title('Comparación de Intercambios en Generaciones Específicas', 
+                    fontsize=14, fontweight='bold')
+        ax.set_xticks(positions)
+        ax.set_xticklabels([f'Gen {g}' for g in tracked_generations])
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Agregar valores en las barras
+        for i, (bar, mean) in enumerate(zip(bars, means)):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + stds[i] + 0.5,
+                   f'{mean:.1f}', ha='center', va='bottom', fontweight='bold')
+        
+        plt.tight_layout()
+        output_path2 = os.path.join(output_dir, "exchange_comparison_generations.png")
+        plt.savefig(output_path2, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  Gráfico de comparación guardado en: {output_path2}")
+
+
+def plot_distribution_by_periods(callback: EvolutionCallback, output_dir: str, max_gen: int = 200):
+    """
+    Genera 3 gráficos de distribución de intercambios:
+    1. Primeras 10 generaciones
+    2. 10 generaciones del medio
+    3. Últimas 10 generaciones
+    
+    Args:
+        callback: Callback con datos de evolución
+        output_dir: Directorio donde guardar los gráficos
+        max_gen: Número máximo de generaciones
+    """
+    if not MATPLOTLIB_OK:
+        print("[ADVERTENCIA] matplotlib no instalado: omitiendo gráficos")
+        return
+    
+    tracked_df = callback.get_tracked_exchanges()
+    if tracked_df.empty:
+        print("[ADVERTENCIA] No hay datos de intercambios para graficar")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Definir los 3 rangos de generaciones
+    first_gen = list(range(1, 11))  # Primeras 10: 1-10
+    mid_start = max(1, (max_gen // 2) - 4)
+    mid_end = min(max_gen, mid_start + 9)
+    mid_gen = list(range(mid_start, mid_end + 1))  # 10 del medio
+    last_start = max(1, max_gen - 9)
+    last_gen = list(range(last_start, max_gen + 1))  # Últimas 10
+    
+    # Filtrar datos disponibles para cada rango
+    first_data = tracked_df[tracked_df['generation'].isin(first_gen)]
+    mid_data = tracked_df[tracked_df['generation'].isin(mid_gen)]
+    last_data = tracked_df[tracked_df['generation'].isin(last_gen)]
+    
+    # Crear los 3 gráficos
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle('Distribución de Intercambios por Períodos de Evolución', 
+                 fontsize=16, fontweight='bold')
+    
+    # Gráfico 1: Primeras 10 generaciones
+    ax1 = axes[0]
+    if not first_data.empty:
+        # Boxplot para cada generación
+        box_data = []
+        labels = []
+        for gen in sorted(first_gen):
+            gen_data = first_data[first_data['generation'] == gen]['n_exchanges']
+            if len(gen_data) > 0:
+                box_data.append(gen_data.values)
+                labels.append(f'Gen {gen}')
+        
+        if box_data:
+            bp1 = ax1.boxplot(box_data, labels=labels, patch_artist=True)
+            for patch in bp1['boxes']:
+                patch.set_facecolor('lightblue')
+                patch.set_alpha(0.7)
+            # Ocultar la línea de la mediana
+            for median in bp1['medians']:
+                median.set_visible(False)
+            # Agregar media como línea horizontal roja dentro de cada caja
+            means = [np.mean(data) for data in box_data]
+            positions = range(1, len(means) + 1)
+            for pos, mean_val in zip(positions, means):
+                ax1.plot([pos - 0.3, pos + 0.3], [mean_val, mean_val], 'r-', linewidth=2, zorder=3)
+            # Agregar etiqueta solo una vez
+            ax1.plot([], [], 'r-', linewidth=2, label='Media')
+            ax1.set_title(f'Primeras 10 Generaciones\n(1-10)', 
+                         fontsize=12, fontweight='bold')
+            ax1.set_xlabel('Generación', fontsize=10)
+            ax1.set_ylabel('Número de Intercambios', fontsize=10)
+            ax1.tick_params(axis='x', rotation=45)
+            ax1.grid(True, alpha=0.3, axis='y')
+            ax1.legend(fontsize=8)
+        else:
+            ax1.text(0.5, 0.5, 'No hay datos disponibles', 
+                    ha='center', va='center', transform=ax1.transAxes)
+            ax1.set_title('Primeras 10 Generaciones', fontsize=12)
+    else:
+        ax1.text(0.5, 0.5, 'No hay datos disponibles', 
+                ha='center', va='center', transform=ax1.transAxes)
+        ax1.set_title('Primeras 10 Generaciones', fontsize=12)
+    
+    # Gráfico 2: 10 generaciones del medio
+    ax2 = axes[1]
+    if not mid_data.empty:
+        box_data = []
+        labels = []
+        for gen in sorted(mid_gen):
+            gen_data = mid_data[mid_data['generation'] == gen]['n_exchanges']
+            if len(gen_data) > 0:
+                box_data.append(gen_data.values)
+                labels.append(f'Gen {gen}')
+        
+        if box_data:
+            bp2 = ax2.boxplot(box_data, labels=labels, patch_artist=True)
+            for patch in bp2['boxes']:
+                patch.set_facecolor('lightgreen')
+                patch.set_alpha(0.7)
+            # Ocultar la línea de la mediana
+            for median in bp2['medians']:
+                median.set_visible(False)
+            # Agregar media como línea horizontal roja dentro de cada caja
+            means = [np.mean(data) for data in box_data]
+            positions = range(1, len(means) + 1)
+            for pos, mean_val in zip(positions, means):
+                ax2.plot([pos - 0.3, pos + 0.3], [mean_val, mean_val], 'r-', linewidth=2, zorder=3)
+            # Agregar etiqueta solo una vez
+            ax2.plot([], [], 'r-', linewidth=2, label='Media')
+            ax2.set_title(f'10 Generaciones del Medio\n({mid_start}-{mid_end})', 
+                         fontsize=12, fontweight='bold')
+            ax2.set_xlabel('Generación', fontsize=10)
+            ax2.set_ylabel('Número de Intercambios', fontsize=10)
+            ax2.tick_params(axis='x', rotation=45)
+            ax2.grid(True, alpha=0.3, axis='y')
+            ax2.legend(fontsize=8)
+        else:
+            ax2.text(0.5, 0.5, 'No hay datos disponibles', 
+                    ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title(f'10 Generaciones del Medio ({mid_start}-{mid_end})', fontsize=12)
+    else:
+        ax2.text(0.5, 0.5, 'No hay datos disponibles', 
+                ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title(f'10 Generaciones del Medio ({mid_start}-{mid_end})', fontsize=12)
+    
+    # Gráfico 3: Últimas 10 generaciones
+    ax3 = axes[2]
+    if not last_data.empty:
+        box_data = []
+        labels = []
+        for gen in sorted(last_gen):
+            gen_data = last_data[last_data['generation'] == gen]['n_exchanges']
+            if len(gen_data) > 0:
+                box_data.append(gen_data.values)
+                labels.append(f'Gen {gen}')
+        
+        if box_data:
+            bp3 = ax3.boxplot(box_data, labels=labels, patch_artist=True)
+            for patch in bp3['boxes']:
+                patch.set_facecolor('lightcoral')
+                patch.set_alpha(0.7)
+            # Ocultar la línea de la mediana
+            for median in bp3['medians']:
+                median.set_visible(False)
+            # Agregar media como línea horizontal roja dentro de cada caja
+            means = [np.mean(data) for data in box_data]
+            positions = range(1, len(means) + 1)
+            for pos, mean_val in zip(positions, means):
+                ax3.plot([pos - 0.3, pos + 0.3], [mean_val, mean_val], 'r-', linewidth=2, zorder=3)
+            # Agregar etiqueta solo una vez
+            ax3.plot([], [], 'r-', linewidth=2, label='Media')
+            ax3.set_title(f'Últimas 10 Generaciones\n({last_start}-{max_gen})', 
+                         fontsize=12, fontweight='bold')
+            ax3.set_xlabel('Generación', fontsize=10)
+            ax3.set_ylabel('Número de Intercambios', fontsize=10)
+            ax3.tick_params(axis='x', rotation=45)
+            ax3.grid(True, alpha=0.3, axis='y')
+            ax3.legend(fontsize=8)
+        else:
+            ax3.text(0.5, 0.5, 'No hay datos disponibles', 
+                    ha='center', va='center', transform=ax3.transAxes)
+            ax3.set_title(f'Últimas 10 Generaciones ({last_start}-{max_gen})', fontsize=12)
+    else:
+        ax3.text(0.5, 0.5, 'No hay datos disponibles', 
+                ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title(f'Últimas 10 Generaciones ({last_start}-{max_gen})', fontsize=12)
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "exchange_distribution_by_periods.png")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Gráfico de distribución por períodos guardado en: {output_path}")
+
+
+def plot_pareto_front(pareto_df: pd.DataFrame, output_dir: str):
+    """
+    Genera gráficos del frente de Pareto en 2D
+    
+    Args:
+        pareto_df: DataFrame con el frente de Pareto (columnas: 1-cov_health, 1-cov_education, 
+                   1-cov_greens, 1-cov_work, change_ratio, solution_index, score)
+        output_dir: Directorio donde guardar los gráficos
+    """
+    if not MATPLOTLIB_OK:
+        print("[ADVERTENCIA] matplotlib no instalado: omitiendo gráfico de frente de Pareto")
+        return
+    
+    if pareto_df.empty:
+        print("[ADVERTENCIA] No hay datos del frente de Pareto para graficar")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Crear figura con múltiples subplots para diferentes vistas del frente de Pareto
+    fig = plt.figure(figsize=(18, 14))
+    fig.suptitle('Análisis del Frente de Pareto', fontsize=16, fontweight='bold')
+    
+    # Gráfico 1: Cobertura Salud vs Cobertura Educación
+    ax1 = plt.subplot(3, 3, 1)
+    scatter1 = ax1.scatter(pareto_df['1-cov_health'], pareto_df['1-cov_education'], 
+                           c=pareto_df['change_ratio'], cmap='viridis', 
+                           s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+    # Marcar la solución óptima (menor score)
+    if 'score' in pareto_df.columns:
+        best_idx = pareto_df['score'].idxmin()
+        ax1.scatter(pareto_df.loc[best_idx, '1-cov_health'], 
+                   pareto_df.loc[best_idx, '1-cov_education'],
+                   s=200, marker='*', color='red', edgecolors='black', 
+                   linewidth=2, label='Solución óptima', zorder=5)
+    ax1.set_xlabel('1 - Cobertura Salud', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('1 - Cobertura Educación', fontsize=11, fontweight='bold')
+    ax1.set_title('Salud vs Educación', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    plt.colorbar(scatter1, ax=ax1, label='Change Ratio')
+    
+    # Gráfico 2: Cobertura Salud vs Cobertura Áreas Verdes
+    ax2 = plt.subplot(3, 3, 2)
+    scatter2 = ax2.scatter(pareto_df['1-cov_health'], pareto_df['1-cov_greens'], 
+                          c=pareto_df['change_ratio'], cmap='viridis', 
+                          s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+    if 'score' in pareto_df.columns:
+        ax2.scatter(pareto_df.loc[best_idx, '1-cov_health'], 
+                   pareto_df.loc[best_idx, '1-cov_greens'],
+                   s=200, marker='*', color='red', edgecolors='black', 
+                   linewidth=2, label='Solución óptima', zorder=5)
+    ax2.set_xlabel('1 - Cobertura Salud', fontsize=11, fontweight='bold')
+    ax2.set_ylabel('1 - Cobertura Áreas Verdes', fontsize=11, fontweight='bold')
+    ax2.set_title('Salud vs Áreas Verdes', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    plt.colorbar(scatter2, ax=ax2, label='Change Ratio')
+    
+    # Gráfico 3: Cobertura Educación vs Cobertura Trabajo
+    ax3 = plt.subplot(3, 3, 3)
+    scatter3 = ax3.scatter(pareto_df['1-cov_education'], pareto_df['1-cov_work'], 
+                          c=pareto_df['change_ratio'], cmap='viridis', 
+                          s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+    if 'score' in pareto_df.columns:
+        ax3.scatter(pareto_df.loc[best_idx, '1-cov_education'], 
+                   pareto_df.loc[best_idx, '1-cov_work'],
+                   s=200, marker='*', color='red', edgecolors='black', 
+                   linewidth=2, label='Solución óptima', zorder=5)
+    ax3.set_xlabel('1 - Cobertura Educación', fontsize=11, fontweight='bold')
+    ax3.set_ylabel('1 - Cobertura Trabajo', fontsize=11, fontweight='bold')
+    ax3.set_title('Educación vs Trabajo', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+    plt.colorbar(scatter3, ax=ax3, label='Change Ratio')
+    
+    # Gráfico 4: Change Ratio vs Déficit de Cobertura Promedio
+    ax4 = plt.subplot(3, 3, 4)
+    avg_coverage_deficit = (pareto_df['1-cov_health'] + pareto_df['1-cov_education'] + 
+                           pareto_df['1-cov_greens'] + pareto_df['1-cov_work']) / 4.0
+    scatter4 = ax4.scatter(pareto_df['change_ratio'], avg_coverage_deficit, 
+                          c=pareto_df['score'] if 'score' in pareto_df.columns else None,
+                          cmap='plasma', s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+    if 'score' in pareto_df.columns:
+        ax4.scatter(pareto_df.loc[best_idx, 'change_ratio'], 
+                   avg_coverage_deficit.loc[best_idx],
+                   s=200, marker='*', color='red', edgecolors='black', 
+                   linewidth=2, label='Solución óptima', zorder=5)
+    ax4.set_xlabel('Change Ratio', fontsize=11, fontweight='bold')
+    ax4.set_ylabel('Déficit de Cobertura Promedio', fontsize=11, fontweight='bold')
+    ax4.set_title('Cambio Territorial vs Déficit de Cobertura', fontsize=12, fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend()
+    if 'score' in pareto_df.columns:
+        plt.colorbar(scatter4, ax=ax4, label='Score')
+    
+    # Gráfico 5: Distribución del Score
+    ax5 = plt.subplot(3, 3, 5)
+    if 'score' in pareto_df.columns:
+        ax5.hist(pareto_df['score'], bins=20, edgecolor='black', alpha=0.7, color='steelblue')
+        ax5.axvline(pareto_df['score'].min(), color='red', linestyle='--', 
+                   linewidth=2, label=f'Óptimo: {pareto_df["score"].min():.4f}')
+        ax5.axvline(pareto_df['score'].mean(), color='green', linestyle='--', 
+                   linewidth=2, label=f'Promedio: {pareto_df["score"].mean():.4f}')
+        ax5.set_xlabel('Score', fontsize=11, fontweight='bold')
+        ax5.set_ylabel('Frecuencia', fontsize=11, fontweight='bold')
+        ax5.set_title('Distribución del Score en el Frente de Pareto', fontsize=12, fontweight='bold')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3, axis='y')
+    else:
+        ax5.text(0.5, 0.5, 'Score no disponible', 
+                ha='center', va='center', transform=ax5.transAxes)
+        ax5.set_title('Distribución del Score', fontsize=12)
+    
+    # Gráfico 6: Cobertura vs Change Ratio (relación principal)
+    ax6 = plt.subplot(3, 3, 7)
+    # Calcular cobertura promedio (1 - déficit promedio)
+    avg_coverage_deficit = (pareto_df['1-cov_health'] + pareto_df['1-cov_education'] + 
+                           pareto_df['1-cov_greens'] + pareto_df['1-cov_work']) / 4.0
+    avg_coverage = 1.0 - avg_coverage_deficit  # Convertir déficit a cobertura
+    
+    scatter6 = ax6.scatter(pareto_df['change_ratio'], avg_coverage * 100, 
+                          c=pareto_df['score'] if 'score' in pareto_df.columns else None,
+                          cmap='coolwarm', s=80, alpha=0.7, edgecolors='black', linewidth=1)
+    # Marcar la solución óptima
+    if 'score' in pareto_df.columns:
+        best_idx = pareto_df['score'].idxmin()
+        ax6.scatter(pareto_df.loc[best_idx, 'change_ratio'], 
+                   avg_coverage.loc[best_idx] * 100,
+                   s=300, marker='*', color='gold', edgecolors='black', 
+                   linewidth=2, label='Solución óptima', zorder=5)
+    ax6.set_xlabel('Change Ratio (Proporción de Cambios)', fontsize=11, fontweight='bold')
+    ax6.set_ylabel('Cobertura Promedio (%)', fontsize=11, fontweight='bold')
+    ax6.set_title('Cobertura vs Cambio Territorial', fontsize=12, fontweight='bold')
+    ax6.grid(True, alpha=0.3)
+    ax6.legend()
+    if 'score' in pareto_df.columns:
+        plt.colorbar(scatter6, ax=ax6, label='Score')
+    
+    # Gráfico 7: Resumen estadístico del frente
+    ax7 = plt.subplot(3, 3, 8)
+    ax7.axis('off')
+    stats_text = f"""
+    ESTADÍSTICAS DEL FRENTE DE PARETO
+    
+    Número de soluciones: {len(pareto_df)}
+    
+    Cobertura Salud:
+      Min: {pareto_df['1-cov_health'].min():.3f}
+      Max: {pareto_df['1-cov_health'].max():.3f}
+      Promedio: {pareto_df['1-cov_health'].mean():.3f}
+    
+    Cobertura Educación:
+      Min: {pareto_df['1-cov_education'].min():.3f}
+      Max: {pareto_df['1-cov_education'].max():.3f}
+      Promedio: {pareto_df['1-cov_education'].mean():.3f}
+    
+    Cobertura Áreas Verdes:
+      Min: {pareto_df['1-cov_greens'].min():.3f}
+      Max: {pareto_df['1-cov_greens'].max():.3f}
+      Promedio: {pareto_df['1-cov_greens'].mean():.3f}
+    
+    Cobertura Trabajo:
+      Min: {pareto_df['1-cov_work'].min():.3f}
+      Max: {pareto_df['1-cov_work'].max():.3f}
+      Promedio: {pareto_df['1-cov_work'].mean():.3f}
+    
+    Change Ratio:
+      Min: {pareto_df['change_ratio'].min():.3f}
+      Max: {pareto_df['change_ratio'].max():.3f}
+      Promedio: {pareto_df['change_ratio'].mean():.3f}
+    """
+    if 'score' in pareto_df.columns:
+        stats_text += f"""
+    
+    Score:
+      Min: {pareto_df['score'].min():.4f}
+      Max: {pareto_df['score'].max():.4f}
+      Promedio: {pareto_df['score'].mean():.4f}
+        """
+    ax7.text(0.1, 0.9, stats_text, transform=ax7.transAxes, 
+            fontsize=9, verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Gráfico 8: Análisis de trade-off Cobertura vs Change (gráfico adicional)
+    ax8 = plt.subplot(3, 3, 9)
+    # Calcular cobertura promedio para cada solución individual
+    avg_coverage_deficit = (pareto_df['1-cov_health'] + pareto_df['1-cov_education'] + 
+                           pareto_df['1-cov_greens'] + pareto_df['1-cov_work']) / 4.0
+    avg_coverage = (1.0 - avg_coverage_deficit) * 100  # Convertir déficit a cobertura en porcentaje
+    
+    # Mostrar todos los puntos individuales del frente de Pareto
+    scatter = ax8.scatter(pareto_df['change_ratio'], avg_coverage, 
+                         c=pareto_df['score'] if 'score' in pareto_df.columns else None,
+                         cmap='viridis', s=60, alpha=0.7, edgecolors='black', linewidth=0.5,
+                         label='Soluciones del frente de Pareto')
+    
+    # Marcar la solución óptima
+    if 'score' in pareto_df.columns:
+        best_idx = pareto_df['score'].idxmin()
+        ax8.scatter(pareto_df.loc[best_idx, 'change_ratio'], 
+                   avg_coverage.loc[best_idx],
+                   s=300, marker='*', color='red', edgecolors='black', 
+                   linewidth=2, label='Solución óptima', zorder=5)
+    
+    # Si hay suficientes puntos, también mostrar línea de tendencia o promedios por rangos
+    if len(pareto_df) > 10:
+        # Crear bins para mostrar también promedios por rangos como referencia
+        n_bins = min(10, len(pareto_df) // 3)  # Ajustar número de bins según cantidad de datos
+        if n_bins > 1:
+            bins = np.linspace(pareto_df['change_ratio'].min(), pareto_df['change_ratio'].max(), n_bins + 1)
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+            bin_coverage_avg = []
+            
+            for i in range(len(bins) - 1):
+                mask = (pareto_df['change_ratio'] >= bins[i]) & (pareto_df['change_ratio'] < bins[i+1])
+                if i == len(bins) - 2:
+                    mask = (pareto_df['change_ratio'] >= bins[i]) & (pareto_df['change_ratio'] <= bins[i+1])
+                
+                if mask.sum() > 0:
+                    bin_coverage_avg.append(avg_coverage.loc[mask].mean())
+                else:
+                    bin_coverage_avg.append(np.nan)
+            
+            bin_coverage_avg = np.array(bin_coverage_avg)
+            valid_bins = ~np.isnan(bin_coverage_avg)
+            
+            if valid_bins.sum() > 1:
+                ax8.plot(bin_centers[valid_bins], bin_coverage_avg[valid_bins], 
+                        'r--', linewidth=2, alpha=0.5, label='Promedio por rangos')
+    
+    ax8.set_xlabel('Change Ratio', fontsize=11, fontweight='bold')
+    ax8.set_ylabel('Cobertura Promedio (%)', fontsize=11, fontweight='bold')
+    ax8.set_title('Trade-off: Cobertura vs Cambios (Todas las Soluciones)', 
+                 fontsize=12, fontweight='bold')
+    ax8.grid(True, alpha=0.3)
+    ax8.legend(fontsize=9)
+    if 'score' in pareto_df.columns:
+        plt.colorbar(scatter, ax=ax8, label='Score')
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "pareto_front_analysis.png")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Gráfico del frente de Pareto guardado en: {output_path}")
+
+
+def plot_coverage_comparison(initial_metrics: Dict[str, float], 
+                             final_metrics: Dict[str, float], 
+                             output_dir: str):
+    """
+    Genera gráfico de comparación de coberturas antes y después de la optimización
+    
+    Args:
+        initial_metrics: Diccionario con métricas iniciales (keys: cov_health, cov_education, etc.)
+        final_metrics: Diccionario con métricas finales
+        output_dir: Directorio donde guardar el gráfico
+    """
+    if not MATPLOTLIB_OK:
+        print("[ADVERTENCIA] matplotlib no instalado: omitiendo gráfico de comparación")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Extraer coberturas por categoría
+    categories = ['health', 'education', 'greens', 'work']
+    category_labels = {
+        'health': 'Salud',
+        'education': 'Educación',
+        'greens': 'Áreas Verdes',
+        'work': 'Trabajo'
+    }
+    
+    initial_covs = []
+    final_covs = []
+    improvements = []
+    labels = []
+    
+    for cat in categories:
+        key_initial = f'cov_{cat}'
+        key_final = f'cov_{cat}'
+        
+        if key_initial in initial_metrics and key_final in final_metrics:
+            init_val = initial_metrics[key_initial]
+            final_val = final_metrics[key_final]
+            improvement = final_val - init_val
+            
+            initial_covs.append(init_val)
+            final_covs.append(final_val)
+            improvements.append(improvement)
+            labels.append(category_labels[cat])
+    
+    # También agregar cobertura integral (todas las categorías)
+    if 'cov_all' in initial_metrics and 'cov_all' in final_metrics:
+        initial_covs.append(initial_metrics['cov_all'])
+        final_covs.append(final_metrics['cov_all'])
+        improvements.append(final_metrics['cov_all'] - initial_metrics['cov_all'])
+        labels.append('Todas las\nCategorías')
+    
+    if not initial_covs:
+        print("[ADVERTENCIA] No hay datos de cobertura para comparar")
+        return
+    
+    # Crear figura con dos subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle('Comparación de Coberturas: Estado Inicial vs Optimizado', 
+                fontsize=16, fontweight='bold')
+    
+    # Gráfico 1: Barras comparativas
+    x = np.arange(len(labels))
+    width = 0.35
+    
+    bars1 = ax1.bar(x - width/2, [v * 100 for v in initial_covs], width, 
+                   label='Estado Inicial', color='#ff6b6b', alpha=0.8, edgecolor='black', linewidth=1)
+    bars2 = ax1.bar(x + width/2, [v * 100 for v in final_covs], width, 
+                   label='Estado Optimizado', color='#51cf66', alpha=0.8, edgecolor='black', linewidth=1)
+    
+    # Agregar valores en las barras
+    for i, (bar1, bar2) in enumerate(zip(bars1, bars2)):
+        height1 = bar1.get_height()
+        height2 = bar2.get_height()
+        ax1.text(bar1.get_x() + bar1.get_width()/2., height1,
+                f'{height1:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax1.text(bar2.get_x() + bar2.get_width()/2., height2,
+                f'{height2:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    ax1.set_xlabel('Categoría de Servicio', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Cobertura (%)', fontsize=12, fontweight='bold')
+    ax1.set_title('Cobertura por Categoría', fontsize=13, fontweight='bold')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontsize=10)
+    ax1.legend(fontsize=11)
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.set_ylim(0, max(max(initial_covs), max(final_covs)) * 100 * 1.15)
+    
+    # Gráfico 2: Mejora porcentual
+    colors = ['#4dabf7' if imp >= 0 else '#ff8787' for imp in improvements]
+    bars3 = ax2.barh(labels, [imp * 100 for imp in improvements], 
+                     color=colors, alpha=0.8, edgecolor='black', linewidth=1)
+    
+    # Agregar valores en las barras
+    for i, (bar, imp) in enumerate(zip(bars3, improvements)):
+        width = bar.get_width()
+        ax2.text(width, bar.get_y() + bar.get_height()/2.,
+                f'{width:+.1f}%', ha='left' if width >= 0 else 'right', 
+                va='center', fontsize=10, fontweight='bold')
+    
+    ax2.set_xlabel('Mejora en Cobertura (%)', fontsize=12, fontweight='bold')
+    ax2.set_title('Mejora por Categoría', fontsize=13, fontweight='bold')
+    ax2.axvline(0, color='black', linestyle='-', linewidth=1)
+    ax2.grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "coverage_comparison.png")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Gráfico de comparación de coberturas guardado en: {output_path}")
+
+
 def run_reordering_optimization(
     G: nx.MultiDiGraph,
     homes: gpd.GeoDataFrame,
     services: Dict[str, gpd.GeoDataFrame],
     target_category: str,
     minutes: float = 15.0,
-    max_gen: int = 100,
+    max_gen: int = 200,
     pop_size: int = 100,
     alpha_balance: float = 0.1
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, float]:
@@ -1009,14 +2000,20 @@ def run_reordering_optimization_all_categories(
     homes: gpd.GeoDataFrame,
     services: Dict[str, gpd.GeoDataFrame],
     minutes: float = 15.0,
-    max_gen: int = 100,
-    pop_size: int = 50
-) -> Tuple[gpd.GeoDataFrame, Dict[str, gpd.GeoDataFrame], pd.DataFrame, Dict[str, float]]:
+    max_gen: int = 200,
+    pop_size: int = 50,
+    callback: Optional[EvolutionCallback] = None,
+    track_generations: List[int] = None
+) -> Tuple[gpd.GeoDataFrame, Dict[str, gpd.GeoDataFrame], pd.DataFrame, Dict[str, float], Optional[EvolutionCallback]]:
     """
     Ejecuta optimización con reordenamiento para TODAS las categorías simultáneamente
     
+    Args:
+        callback: Callback personalizado para tracking (si None, se crea uno nuevo)
+        track_generations: Lista de generaciones específicas a capturar (ej: [1, 2, 3, 78, 79, 80])
+    
     Returns:
-        (nuevos_hogares, nuevos_servicios_por_categoria, frente_pareto, mejores_coberturas)
+        (nuevos_hogares, nuevos_servicios_por_categoria, frente_pareto, mejores_coberturas, callback)
     """
     if not PYMOO_OK:
         raise RuntimeError("pymoo no está instalado")
@@ -1028,13 +2025,24 @@ def run_reordering_optimization_all_categories(
         G, homes, services, minutes
     )
     
+    # Crear callback si no se proporciona uno
+    if callback is None:
+        initial_config = problem.initial_config
+        callback = EvolutionCallback(initial_config, track_generations=track_generations)
+        print(f"  [Tracking] Callback creado para rastrear intercambios")
+        if track_generations:
+            print(f"  [Tracking] Generaciones específicas a capturar: {track_generations}")
+    
     # Usar inicialización factible, operadores personalizados y reparador para todas las categorías
+    # initial_change_percentage=0.02: 2% de cambios iniciales respecto a configuración inicial
+    # Con 3200 puntos: ~64 cambios iniciales (en lugar de ~2000)
     sampling = FeasibleSamplingAllCategories(
         n_homes=problem.n_homes,
         n_health=problem.n_health,
         n_education=problem.n_education,
         n_greens=problem.n_greens,
-        n_work=problem.n_work
+        n_work=problem.n_work,
+        initial_change_percentage=0.02  # 2% de cambios iniciales
     )
     crossover = FeasibleCrossoverAllCategories(
         n_homes=problem.n_homes,
@@ -1050,7 +2058,7 @@ def run_reordering_optimization_all_categories(
         n_education=problem.n_education,
         n_greens=problem.n_greens,
         n_work=problem.n_work,
-        prob=0.2
+        prob=0.7
     )
     repair = FeasibleRepairAllCategories(
         n_homes=problem.n_homes,
@@ -1069,7 +2077,11 @@ def run_reordering_optimization_all_categories(
     )
     termination = get_termination("n_gen", max_gen)
     
-    res = minimize(problem, algorithm, termination, verbose=True, seed=42)
+    # Pasar callback a minimize solo si existe (en pymoo 0.6.1.1)
+    if callback is not None:
+        res = minimize(problem, algorithm, termination, verbose=True, seed=42, callback=callback)
+    else:
+        res = minimize(problem, algorithm, termination, verbose=True, seed=42)
     
     # Analizar frente de Pareto
     F = res.F
@@ -1085,7 +2097,7 @@ def run_reordering_optimization_all_categories(
         new_services = {k: v.copy() for k, v in services.items()}
         pareto = pd.DataFrame()
         best_covs = {cat: 0.0 for cat in services.keys()}
-        return new_homes, new_services, pareto, best_covs
+        return new_homes, new_services, pareto, best_covs, callback
     
     # Filtrar soluciones factibles
     margin = max(1, int(min(problem.n_homes, problem.n_health, problem.n_education, problem.n_greens, problem.n_work) * 0.01))
@@ -1118,22 +2130,28 @@ def run_reordering_optimization_all_categories(
     X_feas = X[feasible_mask]
     
     # Crear DataFrame del frente de Pareto
+    # Nota: F_feas[:, 4] contiene change_ratio * 5.0, necesitamos dividir para obtener el ratio puro
+    change_ratio_raw = F_feas[:, 4] / 5.0  # Dividir por 5.0 para obtener el ratio puro
+    
     pareto = pd.DataFrame({
         "1-cov_health": F_feas[:, 0],
         "1-cov_education": F_feas[:, 1],
         "1-cov_greens": F_feas[:, 2],
         "1-cov_work": F_feas[:, 3],
-        "change_ratio": F_feas[:, 4]  # Proporción de cambios
+        "change_ratio": change_ratio_raw  # Proporción de cambios (sin peso)
     })
     pareto["solution_index"] = np.arange(len(pareto))
     
     # Elegir mejor solución (balance entre cobertura y minimización de cambios)
-    # Normalizar objetivos (0-1) y balancear con peso en cambios
+    # Normalizar objetivos (0-1) y balancear con peso moderado en cambios
     norm = (pareto.iloc[:, :4] - pareto.iloc[:, :4].min()) / (pareto.iloc[:, :4].max() - pareto.iloc[:, :4].min() + 1e-9)
+    # Normalizar change_ratio por separado
     norm_changes = pareto["change_ratio"] / (pareto["change_ratio"].max() + 1e-9)
     # Minimizar suma de coberturas (menor es mejor) y cambios (menor es mejor)
-    # Peso 0.3 para cambios: preferir soluciones con menos cambios
-    pareto["score"] = norm.sum(axis=1) + 0.3 * norm_changes
+    # Peso 5.0 para cambios: PENALIZAR moderadamente los cambios en la selección final
+    # Prioriza soluciones con menos cambios, pero permite más exploración que con pesos extremos.
+    # Con este peso, elegirá soluciones que balanceen cobertura y cambios razonablemente.
+    pareto["score"] = norm.sum(axis=1) + 5.0 * norm_changes
     
     best_idx = int(pareto.sort_values("score").iloc[0]["solution_index"])
     x_best = X_feas[best_idx]
@@ -1183,7 +2201,19 @@ def run_reordering_optimization_all_categories(
     print(f"  Hogares: {len(new_homes)} (objetivo: {problem.n_homes})")
     print(f"  Cambios realizados: {n_changes}/{total_locations} ({change_percentage:.1f}%)")
     
-    return new_homes, new_services, pareto, best_covs
+    # Mostrar resumen de tracking si existe
+    if callback and callback.evolution_history:
+        stats_df = callback.get_exchange_stats()
+        if not stats_df.empty:
+            print(f"\n[Tracking] Estadísticas de intercambios:")
+            print(f"  Generaciones rastreadas: {len(callback.generation_data)}")
+            print(f"  Intercambios promedio (inicial): {stats_df.iloc[0]['mean_exchanges']:.1f}")
+            print(f"  Intercambios promedio (final): {stats_df.iloc[-1]['mean_exchanges']:.1f}")
+            if len(stats_df) > 1:
+                improvement = stats_df.iloc[-1]['mean_exchanges'] - stats_df.iloc[0]['mean_exchanges']
+                print(f"  Evolución de intercambios: {improvement:+.1f}")
+    
+    return new_homes, new_services, pareto, best_covs, callback
 
 
 # -----------------------------
@@ -1197,21 +2227,35 @@ def iterative_reordering(
     categories: List[str],
     minutes: float = 15.0,
     n_iterations: int = 1,
-    max_gen: int = 100,
-    pop_size: int = 50
-) -> Tuple[gpd.GeoDataFrame, Dict[str, gpd.GeoDataFrame], List[Dict]]:
+    max_gen: int = 200,
+    pop_size: int = 50,
+    track_generations: List[int] = None,
+    output_dir: str = None
+) -> Tuple[gpd.GeoDataFrame, Dict[str, gpd.GeoDataFrame], List[Dict], Optional[EvolutionCallback], pd.DataFrame]:
     """
     Ejecuta optimización de TODAS las categorías simultáneamente (una sola iteración)
     
+    Args:
+        track_generations: Lista de generaciones específicas a capturar (ej: [1, 2, 3, 78, 79, 80])
+        output_dir: Directorio donde exportar estadísticas y gráficos
+    
     Returns:
-        (hogares_finales, servicios_finales_por_categoria, historial_metricas)
+        (hogares_finales, servicios_finales_por_categoria, historial_metricas, callback, pareto_df)
     """
     # Forzar a 1 iteración (todas las categorías juntas)
     n_iterations = 1
     
+    # Configurar generaciones a rastrear por defecto
+    if track_generations is None:
+        if max_gen >= 80:
+            track_generations = [1, 2, 3, max_gen-2, max_gen-1, max_gen]
+        else:
+            track_generations = [1, 2, 3, max_gen-2, max_gen-1, max_gen]
+    
     print("\n" + "="*70)
     print("OPTIMIZACIÓN CON REORDENAMIENTO - TODAS LAS CATEGORÍAS JUNTAS")
     print("="*70)
+    print(f"\n[Tracking] Generaciones específicas a capturar: {track_generations}")
     
     history = []
     
@@ -1232,13 +2276,14 @@ def iterative_reordering(
     print(f"OPTIMIZANDO TODAS LAS CATEGORÍAS SIMULTÁNEAMENTE")
     print(f"{'='*70}")
     
-    final_homes, final_services, pareto, best_covs = run_reordering_optimization_all_categories(
+    final_homes, final_services, pareto_df, best_covs, callback = run_reordering_optimization_all_categories(
         G=G,
         homes=initial_homes,
         services=initial_services,
         minutes=minutes,
         max_gen=max_gen,
-        pop_size=pop_size
+        pop_size=pop_size,
+        track_generations=track_generations
     )
     
     # Evaluar estado final
@@ -1269,7 +2314,16 @@ def iterative_reordering(
     print(f"  Mejora: {improvement:+.1f}%")
     print(f"  Hogares mantenidos: {len(final_homes)} (inicial: {len(initial_homes)})")
     
-    return final_homes, final_services, history
+    # Exportar estadísticas y gráficos si hay callback y directorio de salida
+    if callback and output_dir:
+        print(f"\n[Exportando estadísticas y gráficos evolutivos...]")
+        callback.export_detailed_stats(output_dir)
+        plot_exchange_evolution(callback, output_dir)
+        # Gráficos de distribución por períodos (primeras 10, medio 10, últimas 10)
+        plot_distribution_by_periods(callback, output_dir, max_gen=max_gen)
+        print(f"  Estadísticas y gráficos guardados en: {output_dir}")
+    
+    return final_homes, final_services, history, callback, pareto_df
 
 
 # -----------------------------
@@ -1281,6 +2335,156 @@ try:
     FOLIUM_OK = True
 except Exception:
     FOLIUM_OK = False
+
+
+def create_initial_map_with_nodes(
+    boundary: gpd.GeoDataFrame,
+    homes: gpd.GeoDataFrame,
+    services: Dict[str, gpd.GeoDataFrame],
+    G: nx.MultiDiGraph,
+    minutes: float = 15.0
+):
+    """Crea mapa interactivo del estado inicial donde al hacer clic en una casa se muestra su nodo más cercano"""
+    if not FOLIUM_OK:
+        print("folium no instalado: omitiendo mapa")
+        return None
+    
+    import folium
+    from folium import plugins
+    
+    # Calcular nodos más cercanos para cada casa
+    print("  [Mapa Inicial] Calculando nodos más cercanos para cada casa...")
+    home_nodes = nearest_node_series(G, homes)
+    
+    # Obtener coordenadas de los nodos
+    node_coords = {}
+    for idx, home_node in home_nodes.items():
+        if home_node is not None and home_node in G.nodes:
+            node_coords[idx] = {
+                'node_id': home_node,
+                'lat': G.nodes[home_node].get('y', homes.loc[idx].geometry.y),
+                'lon': G.nodes[home_node].get('x', homes.loc[idx].geometry.x)
+            }
+    
+    center = [boundary.geometry.centroid.y.iloc[0], boundary.geometry.centroid.x.iloc[0]]
+    m = folium.Map(location=center, zoom_start=14, control_scale=True)
+    
+    # Límite
+    folium.GeoJson(
+        boundary.to_json(),
+        name="Límite del distrito",
+        style_function=lambda x: {'fillColor': 'none', 'color': 'black', 'weight': 2}
+    ).add_to(m)
+    
+    # Grupo para nodos (inicialmente oculto)
+    fg_nodes = folium.FeatureGroup(name="🔵 Nodos de la Red", show=False).add_to(m)
+    
+    # Marcar nodos únicos usados por las casas
+    unique_nodes = {}
+    for idx, node_info in node_coords.items():
+        node_id = node_info['node_id']
+        if node_id not in unique_nodes:
+            unique_nodes[node_id] = node_info
+    
+    # Agregar nodos al mapa
+    for node_id, node_info in unique_nodes.items():
+        folium.CircleMarker(
+            [node_info['lat'], node_info['lon']],
+            radius=4,
+            color='blue',
+            fill=True,
+            fillColor='blue',
+            fillOpacity=0.6,
+            weight=2,
+            tooltip=f"Nodo ID: {node_id}"
+        ).add_to(fg_nodes)
+    
+    # Grupo para casas
+    fg_homes = folium.FeatureGroup(name="🏠 Hogares (Click para ver nodo)", show=True).add_to(m)
+    
+    # Agregar casas con popup interactivo
+    for idx, row in homes.iterrows():
+        node_info = node_coords.get(idx, None)
+        
+        if node_info:
+            # Popup con información del nodo
+            popup_html = f"""
+            <div style="font-family: Arial; font-size: 12px;">
+                <h4>🏠 Hogar #{idx}</h4>
+                <hr>
+                <p><strong>Ubicación:</strong></p>
+                <p>Lat: {row.geometry.y:.6f}<br>Lon: {row.geometry.x:.6f}</p>
+                <hr>
+                <p><strong>🔵 Nodo más cercano:</strong></p>
+                <p><b>ID del nodo:</b> {node_info['node_id']}</p>
+                <p><b>Lat:</b> {node_info['lat']:.6f}</p>
+                <p><b>Lon:</b> {node_info['lon']:.6f}</p>
+            </div>
+            """
+        else:
+            popup_html = f"""
+            <div style="font-family: Arial; font-size: 12px;">
+                <h4>🏠 Hogar #{idx}</h4>
+                <hr>
+                <p><strong>Ubicación:</strong></p>
+                <p>Lat: {row.geometry.y:.6f}<br>Lon: {row.geometry.x:.6f}</p>
+                <hr>
+                <p><strong>⚠️ Nodo no encontrado</strong></p>
+            </div>
+            """
+        
+        folium.CircleMarker(
+            [row.geometry.y, row.geometry.x],
+            radius=3,
+            color='darkblue',
+            fill=True,
+            fillColor='darkblue',
+            fillOpacity=0.7,
+            weight=2,
+            tooltip=f"Hogar #{idx} - Click para ver nodo",
+            popup=folium.Popup(popup_html, max_width=300)
+        ).add_to(fg_homes)
+    
+    # Servicios iniciales
+    fg_services = folium.FeatureGroup(name="📍 Servicios", show=True).add_to(m)
+    colors = {"health": "red", "education": "blue", "greens": "green", "work": "purple"}
+    for cat, g in services.items():
+        for idx, row in g.iterrows():
+            folium.CircleMarker(
+                [row.geometry.y, row.geometry.x],
+                radius=6,
+                color=colors.get(cat, 'gray'),
+                fill=True,
+                fillColor=colors.get(cat, 'gray'),
+                fillOpacity=0.8,
+                weight=2,
+                tooltip=f"Servicio: {cat}"
+            ).add_to(fg_services)
+    
+    # Leyenda
+    legend_html = f'''
+    <div style="position: fixed; 
+                top: 50px; right: 50px; width: 280px; height: auto; 
+                background-color: white; z-index:9999; font-size:14px;
+                border:2px solid grey; border-radius: 5px; padding: 10px">
+        <p><strong>🗺️ Mapa Estado Inicial (Antes de NSGA-II)</strong></p>
+        <hr>
+        <p><span style="color:darkblue">●</span> <strong>Hogar</strong> (Click para ver nodo)</p>
+        <p><span style="color:blue">●</span> Nodo de la red más cercano</p>
+        <hr>
+        <p><span style="color:red">●</span> Salud</p>
+        <p><span style="color:blue">●</span> Educación</p>
+        <p><span style="color:green">●</span> Áreas verdes</p>
+        <p><span style="color:purple">●</span> Trabajo</p>
+        <hr>
+        <p><small><em>Click en una casa para ver su nodo más cercano</em></small></p>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    folium.LayerControl(collapsed=False).add_to(m)
+    
+    return m
 
 
 def create_comparison_map(
@@ -1447,19 +2651,34 @@ def main():
                        help="Número máximo de hogares a considerar (None = todos los encontrados)")
     parser.add_argument("--iterations", type=int, default=1,
                        help="Número de iteraciones de optimización (ahora solo 1: todas las categorías juntas)")
-    parser.add_argument("--generations", type=int, default=100,
+    parser.add_argument("--generations", type=int, default=200,
                        help="Generaciones por optimización NSGA-II")
     parser.add_argument("--population", type=int, default=50,
                        help="Tamaño de población NSGA-II")
     parser.add_argument("--categories", type=str, nargs='+',
-                       default=["health", "education", "greens"],
+                       default=["health", "education", "greens", "work"],
                        help="Categorías a optimizar")
     parser.add_argument("--plot", action="store_true",
                        help="Generar mapa interactivo")
     parser.add_argument("--output-dir", type=str, default="outputs_reordenamiento",
                        help="Directorio de salida")
+    parser.add_argument("--track-generations", type=int, nargs='+', default=None,
+                       help="Generaciones específicas a capturar para tracking (ej: 1 2 3 78 79 80)")
     
     args = parser.parse_args()
+    
+    # Configurar generaciones a rastrear
+    track_generations = args.track_generations
+    if track_generations is None:
+        # Por defecto: primeras 10, 10 del medio, y últimas 10 generaciones
+        max_gen = args.generations
+        # Primeras 10: 1-10
+        # 10 del medio: aproximadamente la mitad ± 5
+        mid_start = max(1, (max_gen // 2) - 4)
+        mid_end = min(max_gen, mid_start + 9)
+        # Últimas 10: max_gen-9 a max_gen
+        last_start = max(1, max_gen - 9)
+        track_generations = list(range(1, 11)) + list(range(mid_start, mid_end + 1)) + list(range(last_start, max_gen + 1))
     
     # Crear directorio de salida
     out_dir = os.path.abspath(args.output_dir)
@@ -1505,8 +2724,20 @@ def main():
     for k, v in initial_metrics.items():
         print(f"  {k}: {v:.3f} ({v*100:.1f}%)")
     
+    # 2.5. GENERAR MAPA INICIAL (ANTES DE NSGA-II)
+    if FOLIUM_OK:
+        print(f"\n[Generando mapa inicial con nodos...]")
+        m_initial = create_initial_map_with_nodes(
+            boundary, homes, services, G, args.minutes
+        )
+        if m_initial is not None:
+            initial_map_path = os.path.join(out_dir, "initial_map_with_nodes.html")
+            m_initial.save(initial_map_path)
+            print(f"  Mapa inicial guardado en: {initial_map_path}")
+            print(f"  (Click en una casa para ver su nodo más cercano)")
+    
     # 3. OPTIMIZACIÓN ITERATIVA
-    final_homes, final_services, history = iterative_reordering(
+    final_homes, final_services, history, callback, pareto_df = iterative_reordering(
         G=G,
         initial_homes=homes,
         initial_services=services,
@@ -1514,7 +2745,9 @@ def main():
         minutes=args.minutes,
         n_iterations=args.iterations,
         max_gen=args.generations,
-        pop_size=args.population
+        pop_size=args.population,
+        track_generations=track_generations,
+        output_dir=out_dir
     )
     
     # 4. EVALUACIÓN FINAL
@@ -1565,7 +2798,20 @@ def main():
     print("\n[COMPARATIVA FINAL]")
     print(comparison.to_string(index=False))
     
-    # 6. GENERAR MAPA
+    # 6. GENERAR GRÁFICOS ADICIONALES
+    if MATPLOTLIB_OK:
+        print(f"\n[Generando gráficos adicionales...]")
+        
+        # Gráfico del frente de Pareto
+        if pareto_df is not None and not pareto_df.empty:
+            plot_pareto_front(pareto_df, out_dir)
+        else:
+            print("  [ADVERTENCIA] No hay datos del frente de Pareto para graficar")
+        
+        # Gráfico de comparación de coberturas
+        plot_coverage_comparison(initial_metrics, final_metrics, out_dir)
+    
+    # 7. GENERAR MAPA
     if FOLIUM_OK:
         print(f"\n[Generando mapa comparativo...]")
         m = create_comparison_map(
